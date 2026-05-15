@@ -147,36 +147,31 @@ def _allocate_and_reshape_kv_cache(
             else:
                 spec_for_layer[layer_name] = spec
 
-    # -- Pass 1: allocate buffers, map layers to (slot_idx, buf) -----------
-    layer_raw: dict[str, tuple[int, torch.Tensor]] = {}
-    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        assert len(kv_cache_tensor.shared_by) > 0
-        buf = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
-        for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
-            for layer_name in slot_layers:
-                layer_raw[layer_name] = (slot_idx, buf)
-
-    # -- Pass 2: reshape each tensor and distribute views ------------------
+    # Allocate, reshape by unique spec, and distribute views.
     kv_caches: dict[str, Any] = {}
     has_attn, has_mamba = False, False
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         num_layer_slots = len(kv_cache_tensor.shared_by)
-        first_layer = kv_cache_tensor.shared_by[0][0]
-        _, buf = layer_raw[first_layer]
-        spec = spec_for_layer[first_layer]
-        has_attn = has_attn or isinstance(spec, AttentionSpec)
-        has_mamba = has_mamba or isinstance(spec, MambaSpec)
+        assert num_layer_slots > 0
+        buf = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
 
-        views = reshape_kv_cache(
-            buf,
-            spec,
-            num_blocks,
-            num_layers=num_layer_slots,
-            layout=layout,
-        )
+        # Unique specs in this tensor (slots can mix groups/specs).
+        seen_specs: dict[int, list[torch.Tensor]] = {}
         for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
             for layer_name in slot_layers:
-                kv_caches[layer_name] = views[slot_idx]
+                spec = spec_for_layer[layer_name]
+                key = id(spec)
+                if key not in seen_specs:
+                    has_attn = has_attn or isinstance(spec, AttentionSpec)
+                    has_mamba = has_mamba or isinstance(spec, MambaSpec)
+                    seen_specs[key] = reshape_kv_cache(
+                        buf,
+                        spec,
+                        num_blocks,
+                        num_layers=num_layer_slots,
+                        layout=layout,
+                    )
+                kv_caches[layer_name] = seen_specs[key][slot_idx]
 
     if has_attn and has_mamba:
         _update_hybrid_attention_layout(kv_caches, kv_cache_config)
